@@ -186,6 +186,7 @@ python3 tools/tap2h.py game.tap > ESP32-Scorpion/tape.h
 
 - Эмулятор Z80 — [z80emu](https://github.com/anotherlin/z80emu), Lin Ke-Fong (свободная лицензия
   автора: «do whatever you want with it»; файлы z80emu* сохраняют свои заголовки).
+- Проект создан с помощью модели [Claude](https://claude.ai) Opus 5.5 (Anthropic).
 
 ## Лицензия
 

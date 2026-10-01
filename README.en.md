@@ -187,6 +187,7 @@ At startup the first two images in alphabetical order are inserted into A and B.
 
 - Z80 emulator — [z80emu](https://github.com/anotherlin/z80emu) by Lin Ke-Fong (the author's free
   licence: "do whatever you want with it"; the z80emu* files keep their own headers).
+- Built with the help of [Claude](https://claude.ai) Opus 5.5 (Anthropic).
 
 ## Licence
 
