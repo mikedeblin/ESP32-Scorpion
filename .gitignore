@@ -1,0 +1,12 @@
+# Claude (01.10): чужие данные в репозиторий не кладём — их делает каждый сам (см. README)
+rom_scorpion.h
+tape.h
+disks.h
+*.rom
+*.bin
+*.tap
+*.tzx
+*.trd
+*.scl
+# сборка
+build/
