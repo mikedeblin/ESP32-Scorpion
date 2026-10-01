@@ -116,9 +116,13 @@ The sketch catches wrong USB Mode, CDC On Boot and PSRAM settings at compile tim
 
 The ROM is not included: it contains third-party code (Scorpion firmware, Basic 48/128, TR-DOS).
 You need a **Scorpion ZS-256 version 2.95** ROM file, 64 KB (tested: CRC32 `0C6C1EF6`).
+Where to get it (the same file, `scorp295-0C6C1EF7.rom`; the CRC in the name has a typo, the actual
+CRC32 is `0C6C1EF6` — this is the right one):
+- [speccy4ever: Scorpion ROMs](https://speccy4ever.speccy.org/_SC.htm), row "ZS-256 V.2.95" — [direct link](https://speccy4ever.speccy.org/rom/scorp295-0C6C1EF7.rom);
+- [the Scorpion ZS-256 Turbo+ project](https://github.com/romychs/Scorpion256TPlus/blob/main/ROM/scorp295-0C6C1EF7.rom) on GitHub.
 
 ```sh
-python3 tools/rom2h.py scorpion295.rom > ESP32-Scorpion/rom_scorpion.h
+python3 tools/rom2h.py scorp295-0C6C1EF7.rom > ESP32-Scorpion/rom_scorpion.h
 ```
 
 ### 3. Tape (optional)

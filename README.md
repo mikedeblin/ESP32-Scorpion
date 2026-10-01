@@ -115,9 +115,13 @@
 
 ROM в репозитории нет: в нём чужой код (прошивка Скорпиона, Basic 48/128, TR-DOS).
 Нужен файл ROM **Scorpion ZS-256 версии 2.95**, 64 КБ (проверенный: CRC32 `0C6C1EF6`).
+Где взять (файл один и тот же, `scorp295-0C6C1EF7.rom`; в имени CRC с опечаткой, на самом деле
+CRC32 `0C6C1EF6` — это он):
+- [speccy4ever: ROM Скорпиона](https://speccy4ever.speccy.org/_SC.htm), строка «ZS-256 V.2.95» — [прямая ссылка](https://speccy4ever.speccy.org/rom/scorp295-0C6C1EF7.rom);
+- [проект Scorpion ZS-256 Turbo+](https://github.com/romychs/Scorpion256TPlus/blob/main/ROM/scorp295-0C6C1EF7.rom) на GitHub.
 
 ```sh
-python3 tools/rom2h.py scorpion295.rom > ESP32-Scorpion/rom_scorpion.h
+python3 tools/rom2h.py scorp295-0C6C1EF7.rom > ESP32-Scorpion/rom_scorpion.h
 ```
 
 ### 3. Лента (необязательно)
