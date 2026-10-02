@@ -62,6 +62,11 @@
 //   Звук I2S PCM5102: BCK = GPIO1, LCK = GPIO2, DIN = GPIO9.  SD (SPI): CS 10, MOSI 11, CLK 12, MISO 13.
 
 #include "z80emu.h"
+// Claude (01.10.2026): с v19 run_frame() держит HALT сам — нужен z80config.h с Z80_CATCH_HALT.
+//   Старый z80config.h (до v19) молча ломал бы программы: HALT без ожидания прерывания.
+#ifndef Z80_CATCH_HALT
+#error "z80config.h is outdated: take z80config.h from the same release as ESP32-Scorpion.ino"
+#endif
 // Claude (01.10): ЧТО: ROM и лента — не в репозитории, их делает сам пользователь.
 //   ПОЧЕМУ: в ROM 2.95 — чужой код (Скорпион, Basic 48/128, TR-DOS), на игры — права авторов.
 //   rom_scorpion.h: python3 tools/rom2h.py <ROM Scorpion 2.95, 64 КБ> > ESP32-Scorpion/rom_scorpion.h
@@ -110,6 +115,11 @@
 
 static volatile uint32_t zx_frame = 0;      // Claude: счётчик кадров эмуляции (для FLASH)
 static Z80_STATE z80;
+// Claude (01.10.2026): замок для обмена буферами кадра между Z80 (ядро 1) и VGA (прерывание,
+//   ядро 0). Держится на пару команд. Тест на ПК подставляет пустые FB_LOCK/FB_UNLOCK.
+static portMUX_TYPE fb_mux = portMUX_INITIALIZER_UNLOCKED;
+#define FB_LOCK()   portENTER_CRITICAL(&fb_mux)
+#define FB_UNLOCK() portEXIT_CRITICAL(&fb_mux)
 
 // ==== MACHINE BEGIN (Claude: память и страницы Скорпиона; прогоняется тестом на ПК) ====
 // ---------------------------------------------------------------------------
@@ -133,6 +143,30 @@ static uint8_t *zx_ram[16];
 static const uint8_t *zx_rom[4];
 static uint8_t  p7ffd = 0, p1ffd = 0;       // порты Скорпиона
 static uint8_t * volatile zx_screen = nullptr;  // экран для видео: ОЗУ 5 или 7
+
+// Claude (01.10.2026): БУФЕРЫ КАДРА "ПО ЛУЧУ".
+//   ЧТО: run_frame() по ходу кадра копирует каждую строку экрана (32 байта пикселей +
+//   32 байта атрибутов) и цвет бордюра в тот такт, когда её рисовал бы луч ТВ.
+//   VGA рисует из готового буфера, а не из живой памяти.
+//   ПОЧЕМУ: ESP прогоняет кадр Z80 залпом за несколько мс, а VGA читает память в своём
+//   темпе. Демки, которые рисуют за лучом и тут же стирают (The Lyra II, скроллер в
+//   начале: нарисовать -> ждать ~5200 тактов -> стереть, каждый кадр), на ТВ видны
+//   целиком, а у нас VGA ловила то пусто, то полкартинки ("темно - кадр - темно").
+//   Проверено на ПК на этой демке: по лучу текст виден в каждом кадре.
+//   Атрибуты по строкам (а не по знакоместу) — заодно работает мультиколор.
+//   Буферов три: один показывает VGA, один готов к показу, в третий пишет Z80 —
+//   никто никому не мешает, разрывов кадра нет.
+//   Бордюр: 240 строк Спектрума (24 над бумагой, 192, 24 под) — сколько видно на VGA.
+//   ОТКЛОНИЛИ: копию экрана в конце кадра — у такой демки в конце кадра экран пуст.
+static const int FB_LINES = 240, FB_TOP = 24;          // строк бордюра+бумаги; строк над бумагой
+static const int FB_T_PAPER = 14336;                   // такт первой строки бумаги (Fuse/libspectrum, Scorpion)
+static const int FB_T_LINE = 224;                      // тактов в строке
+static uint8_t fb_pix[3][6144];                        // пиксели, раскладка как в ОЗУ Спектрума
+static uint8_t fb_att[3][192 * 32];                    // атрибуты отдельно для каждой строки
+static uint8_t fb_bord[3][FB_LINES];                   // цвет бордюра для каждой строки
+static volatile int8_t fb_front = 0, fb_ready = -1;    // показывается / готов к показу (-1 = нет)
+static int8_t fb_back = 1;                             // сюда пишет текущий кадр Z80
+static volatile bool fb_on = false;                    // false = VGA рисует живой экран (меню, старт)
 static uint8_t  ay_reg[16], ay_sel = 0;     // AY: регистры "со стороны процессора" (для чтения)
 
 // Claude: Раскладка: psram_pages — блок 12*16 КБ (в PSRAM) для страниц 1,3,4,6,8..15.
@@ -218,6 +252,20 @@ const int PIN_RB = 14, PIN_GB = 15, PIN_BB = 16;
 const int PIN_HSYNC = 7, PIN_VSYNC = 8;
 static const int VGA_W = 640, VGA_H = 480;
 
+// Claude (01.10.2026): ЧАСТОТА КАДРОВ VGA — 50 (как у Спектрума) или 60 (стандарт VGA).
+//   ПОЧЕМУ 50: эмуляция идёт 50 кадров/с. При 60 Гц монитор каждый 5-й кадр показывает
+//   дважды — плавный скролл в демках "спотыкается". При 50 Гц кадр на кадр.
+//   50 Гц — нестандартный для VGA режим: если монитор не покажет — поставить 60.
+// Claude (01.10.2026): по умолчанию 60 (решение Майка после проверки v19 на LG): с экраном
+//   "по лучу" разрывов нет и на 60 Гц, остаётся только повтор каждого 5-го кадра; а 50 Гц
+//   на LG сжимает картинку по вертикали. 50 — для тех, у кого монитор его тянет.
+#ifndef VGA_HZ
+#define VGA_HZ 60
+#endif
+#if VGA_HZ != 50 && VGA_HZ != 60
+#error "VGA_HZ: только 50 или 60"
+#endif
+
 // Claude: Экран Спектрума 256x192, удвоенный = 512x384, по центру.
 //   Слева/справа бордюр по 64 пикселя (16 слов по 4 байта), сверху/снизу по 48 строк.
 static const int SCR_TOP = 48, SCR_LINES = 384;
@@ -252,16 +300,18 @@ static void build_tables() {
 
 // ==== RENDER BEGIN (Claude: этот кусок также прогнан тестом на ПК) ====
 // Claude: Рисует одну VGA-строку y (0..479) в dst (640 байт).
-static inline void IRAM_ATTR render_line(int y, uint8_t *dst, uint32_t border_w, bool flash_inv, const uint8_t *scr) {
+// Claude (01.10.2026): pix_base — 6144 байта пикселей в раскладке Спектрума; att — 32 атрибута
+//   ИМЕННО ЭТОЙ строки (буфер "по лучу" хранит атрибуты построчно; для живого экрана
+//   вызывающий передаёт строку атрибутов знакоместа). Для строк бордюра pix/att не нужны.
+static inline void IRAM_ATTR render_line(int y, uint8_t *dst, uint32_t border_w, bool flash_inv,
+                                         const uint8_t *pix_base, const uint8_t *att) {
   uint32_t *w = (uint32_t *)dst;
   if (y < SCR_TOP || y >= SCR_TOP + SCR_LINES) {
     for (int i = 0; i < VGA_W / 4; i++) w[i] = border_w;       // строка целиком — бордюр
   } else {
     int L = (y - SCR_TOP) >> 1;                                 // строка Спектрума 0..191
     // Claude: Хитрая адресация экрана Спектрума: треть / строка знакоместа / строка в знакоместе.
-    //   scr — начало экранной страницы (ОЗУ 5 или 7 по #7FFD.D3), смещения от #4000.
-    const uint8_t *pix = &scr[((L & 0xC0) << 5) | ((L & 0x07) << 8) | ((L & 0x38) << 2)];
-    const uint8_t *att = &scr[0x1800 + ((L >> 3) << 5)];
+    const uint8_t *pix = &pix_base[((L & 0xC0) << 5) | ((L & 0x07) << 8) | ((L & 0x38) << 2)];
     for (int i = 0; i < BORDER_WORDS; i++) *w++ = border_w;    // левый бордюр
     for (int c = 0; c < 32; c++) {
       uint8_t a = att[c];
@@ -320,11 +370,53 @@ static bool IRAM_ATTR on_bounce_empty(esp_lcd_panel_handle_t, void *buf, int pos
   if (dst != (uint8_t *)buf) bb_fixes++;
   int y = pos_px / VGA_W;
   int lines = len_bytes / VGA_W;
-  uint32_t border_w = zx_color_w[zx_border & 7];
   bool flash_inv = (zx_frame >> 4) & 1;        // Claude: FLASH меняет фазу каждые 16 кадров, как в оригинале
-  const uint8_t *scr = zx_screen;              // Claude: экран, видимый в этот момент (5 или 7)
-  for (int i = 0; i < lines; i++) render_line(y + i, dst + i * VGA_W, border_w, flash_inv, scr);
+  // Claude (01.10.2026): ЧТО: в начале кадра VGA (кусок 0) решаем, откуда рисовать весь кадр:
+  //   из готового буфера "по лучу" (если Z80 выложил новый — берём его) или из живого экрана.
+  //   ПОЧЕМУ в начале кадра: смена посреди кадра VGA дала бы разрыв — верх от одного
+  //   кадра Спектрума, низ от другого.
+  static int8_t cur_fb = -1;                   // -1 = живой экран
+  if (k == 0) {
+    if (fb_on) {
+      portENTER_CRITICAL_ISR(&fb_mux);
+      if (fb_ready >= 0) { fb_front = fb_ready; fb_ready = -1; }
+      portEXIT_CRITICAL_ISR(&fb_mux);
+      cur_fb = fb_front;
+    } else {
+      cur_fb = -1;
+    }
+  }
+  if (cur_fb >= 0) {
+    const uint8_t *pix = fb_pix[cur_fb];
+    for (int i = 0; i < lines; i++) {
+      int ln = (y + i) >> 1;                   // строка Спектрума с учётом бордюра: 0..239
+      int L = ln - FB_TOP;                     // строка бумаги (0..191, иначе бордюр)
+      const uint8_t *att = ((unsigned)L < 192) ? &fb_att[cur_fb][L * 32] : nullptr;
+      render_line(y + i, dst + i * VGA_W, zx_color_w[fb_bord[cur_fb][ln] & 7], flash_inv, pix, att);
+    }
+  } else {
+    uint32_t border_w = zx_color_w[zx_border & 7];
+    const uint8_t *scr = zx_screen;            // Claude: экран, видимый в этот момент (5 или 7)
+    for (int i = 0; i < lines; i++) {
+      int L = ((y + i) - SCR_TOP) >> 1;
+      const uint8_t *att = ((unsigned)L < 192) ? &scr[0x1800 + ((L >> 3) << 5)] : nullptr;
+      render_line(y + i, dst + i * VGA_W, border_w, flash_inv, scr, att);
+    }
+  }
   return false;
+}
+
+// Claude (01.10.2026): ЧТО: кадровый импульс VGA будит loop() — при VGA_HZ 50 эмуляция
+//   идёт в такт с монитором (каждый кадр Спектрума показывается ровно один раз).
+//   ПОЧЕМУ не esp_timer: частоты равны (один кварц), но фаза таймера случайна и дрожит —
+//   если выкладка кадра и смена буфера VGA окажутся рядом, пойдут пропуски/повторы.
+static TaskHandle_t loop_task = nullptr;
+static volatile uint32_t vsync_count = 0;
+static bool IRAM_ATTR on_vsync(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t *, void *) {
+  vsync_count = vsync_count + 1;
+  BaseType_t woken = pdFALSE;
+  if (loop_task) vTaskNotifyGiveFromISR(loop_task, &woken);
+  return woken == pdTRUE;
 }
 
 static esp_lcd_panel_handle_t panel = nullptr;
@@ -348,12 +440,29 @@ static void video_init_task(void *) {
   //   (было 16+96+48 = 160, пропорционально ужато до 12+74+37).
   //   HSYNC = 24e6/763 = 31.46 кГц, VSYNC = 31460/525 = 59.9 Гц.
   //   Монитор ждёт 800 тактов на строку — возможно понадобится автонастройка.
+#if VGA_HZ == 50
+  // Claude (01.10.2026): 50 Гц. Кадр = 24e6/50 = 480000 тактов = 768 x 625 — ровно,
+  //   без остатка: строчная 31.25 кГц (удвоенный PAL), 625 строк, кадровая 50.000 Гц.
+  //   ПОЧЕМУ так: pclk не трогаем (только целый делитель, см. выше); кадр ровно 50.000 Гц
+  //   и эмуляция (esp_timer, тот же кварц) ровно 50.000 Гц — не расходятся, без
+  //   периодического повтора/пропуска кадра.
+  //   Строка: 640 + 128 (16/96/48 стандарта, ужато до 13/77/38).
+  //   Кадр: 480 + 145 служебных; лишние строки поровну не делим — монитор сам
+  //   центрирует (автонастройка). 763x629 отклонили: 50.007 Гц, повтор кадра раз в ~150 с.
+  cfg.timings.hsync_pulse_width = 77;
+  cfg.timings.hsync_back_porch  = 38;
+  cfg.timings.hsync_front_porch = 13;
+  cfg.timings.vsync_pulse_width = 2;
+  cfg.timings.vsync_back_porch  = 99;
+  cfg.timings.vsync_front_porch = 44;
+#else
   cfg.timings.hsync_pulse_width = 74;
   cfg.timings.hsync_back_porch  = 37;
   cfg.timings.hsync_front_porch = 12;
   cfg.timings.vsync_pulse_width = 2;
   cfg.timings.vsync_back_porch  = 33;
   cfg.timings.vsync_front_porch = 10;
+#endif
   cfg.timings.flags.hsync_idle_low = 0;        // отрицательные импульсы синхро (стандарт VGA)
   cfg.timings.flags.vsync_idle_low = 0;
 
@@ -383,6 +492,7 @@ static void video_init_task(void *) {
   if (err == ESP_OK) {
     esp_lcd_rgb_panel_event_callbacks_t cbs = {};
     cbs.on_bounce_empty = on_bounce_empty;     // Claude: регистрируем ДО init — init сразу заполняет буферы
+    cbs.on_vsync = on_vsync;                   // Claude (01.10.2026): темп эмуляции от VGA (VGA_HZ 50)
     err = esp_lcd_rgb_panel_register_event_callbacks(panel, &cbs, nullptr);
   }
   if (err == ESP_OK) err = esp_lcd_panel_reset(panel);
@@ -408,6 +518,9 @@ static volatile uint8_t inj_keys[8] = {0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F,
 static volatile bool    f12_request = false;   // Claude: F12 нажата -> в loop() запустить автозагрузку
 static volatile bool    f11_request = false;   // Claude: F11 = кнопка Magic (NMI)
 static volatile bool    f10_request = false;   // Claude: F10 = кнопка Сброс
+// Claude (01.10.2026): Ctrl+Alt+End — полный перезапуск ESP32 (как кнопка на плате), по просьбе Майка:
+//   F10 / Ctrl+Alt+Del сбрасывают только Скорпион; если заглючило глубже, тянуться к плате неудобно.
+static volatile bool    hard_request = false;
 static volatile bool    f9_request = false;    // Claude: F9 = меню дисков
 static volatile bool    menu_active = false;   // Claude: открыто меню — клавиши идут в меню, не в Спектрум
 static volatile uint8_t menu_key = 0;          // Claude: последняя НОВАЯ нажатая клавиша (код HID), 0 = нет
@@ -468,6 +581,16 @@ static void on_kbd_report(uint8_t mods, const uint8_t keys[6], void *) {
   for (int i = 0; i < 6; i++) if (keys[i] == 0x01) return;   // "слишком много клавиш" — игнор
   // --- Claude: меню дисков: берём только что нажатую клавишу, Спектрум ничего не получает ---
   static uint8_t prev_keys[6] = {0, 0, 0, 0, 0, 0};
+  // Claude (01.10.2026): Ctrl+Alt+End — проверяем ДО меню, чтобы работало и в меню F9.
+  {
+    bool end_now = false;
+    for (int i = 0; i < 6; i++) if (keys[i] == 0x4D) end_now = true;   // End
+    if (end_now && (mods & (USBHOST_KEY_MOD_LEFT_CTRL | USBHOST_KEY_MOD_RIGHT_CTRL)) &&
+                   (mods & (USBHOST_KEY_MOD_LEFT_ALT  | USBHOST_KEY_MOD_RIGHT_ALT))) {
+      hard_request = true;
+      return;
+    }
+  }
   if (menu_active) {
     // Claude (01.10): ЧТО: кроме новой клавиши запоминаем, какая клавиша навигации держится.
     //   ПОЧЕМУ здесь: клавиатура шлёт отчёт только при изменении, повторов сама не даёт —
@@ -1194,14 +1317,65 @@ static int magic_frames = 0;   // Claude: >0 — Magic нажата, ждём в
 
 static void magic_press() { magic_frames = 100; }   // Claude: ждём до 2 секунд
 
+// Claude (01.10.2026): СНИМОК ЭКРАНА ПО ЛУЧУ (см. fb_pix). Копирует в буфер fb_back все строки,
+//   до которых луч дошёл к такту t (от прерывания). Строка ln (0..239) рисуется лучом с такта
+//   FB_T_PAPER + (ln - FB_TOP) * FB_T_LINE: 24 строки бордюра над бумагой, 192 бумаги, 24 под.
+//   Берём состояние в НАЧАЛЕ строки — точность до строки (изменения посреди строки не видны).
+static int fb_ln = 0;                                  // следующая строка для снимка
+static inline int fb_line_t(int ln) { return FB_T_PAPER + (ln - FB_TOP) * FB_T_LINE; }
+static void fb_capture_upto(int t) {
+  while (fb_ln < FB_LINES && t >= fb_line_t(fb_ln)) {
+    fb_bord[fb_back][fb_ln] = zx_border;
+    int L = fb_ln - FB_TOP;
+    if ((unsigned)L < 192) {
+      const uint8_t *scr = zx_screen;                  // экран 5 или 7 — какой виден в этот момент
+      int a = ((L & 0xC0) << 5) | ((L & 0x07) << 8) | ((L & 0x38) << 2);
+      memcpy(&fb_pix[fb_back][a], scr + a, 32);
+      memcpy(&fb_att[fb_back][L * 32], scr + 0x1800 + ((L >> 3) << 5), 32);
+    }
+    fb_ln++;
+  }
+}
+// Claude (01.10.2026): кадр готов — отдать его VGA. Новый буфер для записи — тот, который
+//   сейчас не показывается и не ждёт показа (буферов три). Если VGA не успела забрать
+//   прошлый готовый кадр, он просто заменяется новым.
+// Claude (01.10.2026): ИСПРАВЛЕНО (v21). Было: fb_ready читался второй раз ПОСЛЕ замка.
+//   Если прерывание VGA (ядро 0) успевало между этим забрать кадр (fb_ready = -1), выходило
+//   fb_back = 3 - f + 1 = 3 или 4 — буфера с таким номером нет, кадр писался за конец fb_pix
+//   прямо в zx_screen и соседей: полосы, отвал клавиатуры, падение (LoadProhibited по 0x100).
+//   На 50 Гц фаза VGA постоянна и в это окно не попадала; на 60 Гц плывёт — сбой за 10–30 с.
+//   Теперь считаем только по копиям, взятым под замком (pub, f), и проверяем диапазон.
+static void fb_publish() {
+  int8_t pub = fb_back, f;
+  FB_LOCK();
+  fb_ready = pub;
+  f = fb_front;
+  FB_UNLOCK();
+  int8_t nb = (f == pub) ? (int8_t)((pub + 1) % 3) : (int8_t)(3 - f - pub);
+  if (nb < 0 || nb > 2 || nb == pub) nb = (int8_t)((pub + 1) % 3);   // страховка: номер всегда 0..2
+  fb_back = nb;
+  fb_on = true;
+}
+
+static bool z80_halted = false;  // Claude (01.10.2026): процессор стоит на HALT (ждёт INT/NMI)
+
 static void run_frame() {
   // Прерывание в начале кадра (как у ULA). 0xFF — "плавающая шина" для IM 2.
   int used = Z80Interrupt(&z80, 0xFF, nullptr);
+  if (used > 0) z80_halted = false;   // Claude: прерывание принято — HALT закончился
   int target = FRAME_TSTATES - frame_carry - used;
   int done = 0;
+  fb_ln = 0;
   // Claude: Цикл, потому что z80emu останавливается на ED xx (перехват ленты) —
   //   обрабатываем и доигрываем кадр до конца.
+  // Claude (01.10.2026): и ещё на границах строк — снимок экрана по лучу (fb_capture_upto),
+  //   и на HALT: дальше до конца кадра процессор стоит (раньше это делал сам z80emu, но
+  //   только до конца одного вызова Z80Emulate).
   while (done < target) {
+    fb_capture_upto(used + done);
+    int lim = target;                                   // до какого такта гнать этот кусок
+    if (fb_ln < FB_LINES && fb_line_t(fb_ln) - used < lim) lim = fb_line_t(fb_ln) - used;
+    if (lim <= done) lim = done + 1;
     if (magic_frames > 0) {
       // Claude: MAGIC. По руководству вход в монитор возможен, только когда процессор
       //   выполняет команды из ОЗУ. Пока ждём — идём по одной команде и проверяем PC.
@@ -1210,21 +1384,29 @@ static void run_frame() {
         zx_dos_set(1);
         zx_tbase = used + done;
         done += Z80NonMaskableInterrupt(&z80, nullptr);
+        z80_halted = false;                   // Claude: NMI тоже выводит из HALT
         magic_frames = 0;
         Serial.printf("[magic] NMI, ROM page %u\n", (unsigned)zx_rom_page);
         continue;
       }
+      if (z80_halted) { done = lim; continue; }   // Claude: стоим на HALT — такты идут, команд нет
       zx_tbase = used + done;                 // Claude: база времени для событий звука
       done += Z80Emulate(&z80, 1, nullptr);   // одна команда
     } else {
+      if (z80_halted) { done = lim; continue; }
       zx_tbase = used + done;
-      done += Z80Emulate(&z80, target - done, nullptr);
+      done += Z80Emulate(&z80, lim - done, nullptr);
     }
-    if (z80.status == Z80_STATUS_ED_UNDEFINED) {
+    if (z80.status == Z80_STATUS_HALT) {      // Claude: выполнили HALT — PC уже после него (статусы — числа, не биты)
+      z80_halted = true;
+      if (done < lim) done = lim;
+    } else if (z80.status == Z80_STATUS_ED_UNDEFINED) {
       if ((z80.pc & 0xFFFF) == TAPE_TRAP_ADDR && zx_rom_page == 1 && zx_rom0_is_rom) tape_trap();
       else z80.pc = (z80.pc + 2) & 0xFFFF;     // прочие ED xx: на реальном Z80 это NOP
     }
   }
+  fb_capture_upto(1 << 30);                    // Claude: на всякий случай — все строки сняты
+  fb_publish();
   if (magic_frames > 0 && --magic_frames == 0)
     Serial.println("[magic] no reaction: CPU is running ROM code (as on real Scorpion)");
   frame_carry = done - target;
@@ -1632,6 +1814,7 @@ static bool usb_disk_mode_try() {
 
 // Claude: Режим диска: картинка на экране, запись кэша через 0.5 с после последней записи.
 static void usb_disk_mode_run() {
+  fb_on = false;                     // Claude (01.10.2026): экран режима рисуется прямо в память — VGA показывает её
   zx_border = 1;
   scr_clear(0x0F);                                        // белые буквы на синем
   scr_print(2, 5, "SCORPION ZS-256 DISKS");
@@ -1833,6 +2016,8 @@ static void disk_menu_run() {
   scr_buf = scr;
   menu_key = 0;
   menu_active = true;
+  fb_on = false;                     // Claude (01.10.2026): меню рисуется прямо в экран — VGA показывает живую память;
+                                     //   после меню первый же кадр Z80 снова включит буферы (fb_publish)
 
   bool have_fat = fat_mount();
   if (have_fat) storage_scan(); else img_count = 0;
@@ -1846,6 +2031,7 @@ static void disk_menu_run() {
   uint8_t hold_prev = 0;
   uint32_t hold_t0 = 0, rep_t = 0;
   while (!quit) {
+    if (hard_request) break;                              // Claude (01.10.2026): Ctrl+Alt+End — выйти, перезапуск в loop()
     if (redraw) {
       scr_clear(0x0F);                                    // белое на синем
       scr_attr_row(0, 0x30);
@@ -1916,6 +2102,7 @@ static void disk_menu_run() {
 // ==== STORAGE END ====
 
 void setup() {
+  loop_task = xTaskGetCurrentTaskHandle();   // Claude (01.10.2026): setup() и loop() — одна задача; её будит on_vsync
   Serial.begin(115200);
   delay(500);
   Serial.println("=== Scorpion ZS-256 + VGA (ESP32-S3) ===");
@@ -1969,6 +2156,24 @@ void setup() {
                                    AUDIO_RATE, AUDIO_MODE, AUDIO_PIN_L, AUDIO_PIN_R);
 #endif
   else               Serial.println("ERR: audio init failed");
+  // Claude (01.10.2026): контроль: буферы кадра "по лучу" заняли ~37 КБ внутренней RAM.
+  Serial.printf("[mem] internal RAM free %u, largest block %u\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+// Claude (01.10.2026): ПОЛНЫЙ ПЕРЕЗАПУСК ESP32 (Ctrl+Alt+End).
+//   ЧТО: сначала дописать на SD изменённые дорожки .trd (иначе последняя запись TR-DOS
+//   пропадёт), потом esp_restart() — то же, что кнопка сброса на плате.
+//   ПОЧЕМУ флажок boot_to_host: раз клавиатура нажата, ПК на разъёме USB точно нет — сразу
+//   стартуем USB-хостом, без 1.5 с ожидания и лишней перезагрузки.
+//   После перезапуска в A и B снова первые два образа по алфавиту (как при включении).
+static void hard_restart() {
+  Serial.println("[hard reset] Ctrl+Alt+End: saving disks, restarting ESP32");
+  if (sd_ok) for (int d = 0; d < DRIVES_USED; d++) storage_flush_drive(d);
+  Serial.flush();
+  boot_to_host = BOOT_HOST_MAGIC;
+  esp_restart();
 }
 
 void loop() {
@@ -1992,6 +2197,7 @@ void loop() {
 
   // Claude: F12 или автозагрузка при старте: перемотать ленту и набрать LOAD "".
   //   Набор имеет смысл в режиме K (сразу после старта или после сообщения "OK").
+  if (hard_request) hard_restart();  // Claude (01.10.2026): Ctrl+Alt+End — перезапуск ESP32
   if (f10_request) {                 // Claude: F10 — сброс
     f10_request = false;
     zx_machine_reset();
@@ -2022,6 +2228,16 @@ void loop() {
   // --- Темп 50 Гц по часам ---
   // Claude: Ждём до назначенного момента следующего кадра. Длинную часть ожидания
   //   отдаём системе (vTaskDelay), короткую досиживаем в цикле.
+#if VGA_HZ == 50
+  // Claude (01.10.2026): VGA 50 Гц — ждём кадровый импульс монитора (on_vsync). Кадр Z80,
+  //   посчитанный после импульса N, VGA покажет с импульса N+1 — всегда, без пропусков.
+  //   40 мс — страховка: если видео не запустилось, эмуляция всё равно идёт (~25 кадров/с).
+  if (video_status == 1) {
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(40)) == 0) late++;
+    next_us = esp_timer_get_time();
+  } else
+#endif
+  {
   next_us += FRAME_US;
   int64_t now = esp_timer_get_time();
   while (now < next_us) {
@@ -2031,6 +2247,7 @@ void loop() {
   // Claude: Если отстали больше чем на 5 кадров (не успеваем эмулировать) — не
   //   пытаемся "догонять", а сбрасываем расписание.
   if (now - next_us > 5 * FRAME_US) { next_us = now; late++; }
+  }
 
   // --- Раз в секунду: статистика ---
   uint32_t ms = millis();
@@ -2047,7 +2264,7 @@ void loop() {
                   (unsigned)audio_underruns, (unsigned)audio_dropped);
     Serial.printf("  bounce gap: min %u us, max %u us (norm %u us), buffer fixes %u\n",   // Claude: отладка видео
                   (unsigned)(bb_gap_min / 240), (unsigned)(bb_gap_max / 240),
-                  (unsigned)(BB_LINES * 763 / 24), (unsigned)bb_fixes);
+                  (unsigned)(BB_LINES * (VGA_HZ == 50 ? 768 : 763) / 24), (unsigned)bb_fixes);   // Claude (01.10.2026): длина строки зависит от VGA_HZ
     bb_gap_max = 0; bb_gap_min = 0xFFFFFFFF;
     last_frames_sysvar = frames_sysvar;
     frames_in_sec = 0;

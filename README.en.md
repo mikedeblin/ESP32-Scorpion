@@ -9,7 +9,9 @@ I2S DAC, and TR-DOS with disk images on an SD card.
 ## Features
 
 - Scorpion ZS-256: 256 KB RAM, ROM 2.95 (menu, Basic 128/48, shadow monitor via Magic, TR-DOS 5.03)
-- VGA 640×480@60, 15 colours (with BRIGHT), FLASH
+- VGA 640×480 at 60 Hz or 50 Hz (frame-locked to the emulation), 15 colours (with BRIGHT), FLASH
+- Beam-accurate screen capture: each line is taken at the T-state a TV would draw it, so
+  beam-racing demo effects, multicolour and border stripes work
 - USB keyboard (boot protocol) via OTG
 - Sound: AY-3-8912 + beeper, ACB stereo, 48 kHz on a PCM5102
 - TR-DOS: emulated WD1793 (VG93) controller, drives A and B, `.trd` and `.scl` images
@@ -167,7 +169,8 @@ At startup the first two images in alphabetical order are inserted into A and B.
 | CapsLock | CAPS LOCK (CAPS+2) |
 | Tab | extended mode (CAPS+SYM) |
 | **F9** | disk menu: ↑/↓ (hold to scroll), PgUp/PgDn, Home/End; A or Enter → drive A, B → drive B, `<empty>` ejects, Esc — back |
-| **F10** or Ctrl+Alt+Del | reset |
+| **F10** or Ctrl+Alt+Del | reset the Scorpion (disks stay inserted) |
+| **Ctrl+Alt+End** | full ESP32 restart, like the board's reset button (disk changes are saved to SD first; A and B get the first images again) |
 | **F11** | Magic (shadow monitor) |
 | **F12** | rewind the tape + `LOAD ""` (from 48 BASIC) |
 
@@ -179,9 +182,14 @@ At startup the first two images in alphabetical order are inserted into A and B.
 
 ## Limitations
 
-- Frame timing is the 48K one (69888 T-states), with no contended memory delays.
+- 69888 T-states per frame, no contended memory — same as the Scorpion (checked against Fuse,
+  MAME, Unreal Speccy). Not emulated: even-T-state M1 alignment, 32-T INT length, floating bus
+  on port #FF. Screen and border are line-accurate, not T-state-accurate.
 - WD1793: Read Track is not implemented (TR-DOS doesn't use it).
-- VGA timing is slightly non-standard (763 pixels per line) — the monitor may need "Auto adjust".
+- VGA defaults to 640×480@60 (763 pixels per line — near-standard); at 60 Hz every 5th
+  Spectrum frame is shown twice. For frame-exact output set `#define VGA_HZ 50` near the top of
+  `ESP32-Scorpion.ino` (768×625 total, 31.25 kHz line rate — non-standard; not every monitor
+  shows it, some squeeze the picture). The monitor may need "Auto adjust".
 
 ## Credits
 
